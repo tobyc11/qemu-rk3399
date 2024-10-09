@@ -38,6 +38,13 @@ enum {
     RK3399_DEV_UART3,
     RK3399_DEV_RKTIMER,
     RK3399_DEV_GRF,
+    RK3399_DEV_CPU_DEBUG0,
+    RK3399_DEV_CPU_DEBUG1,
+    RK3399_DEV_CPU_DEBUG2,
+    RK3399_DEV_CPU_DEBUG3,
+    RK3399_DEV_CPU_DEBUG4,
+    RK3399_DEV_CPU_DEBUG5,
+    RK3399_DEV_PMU,
 };
 
 /* Memory map */
@@ -55,6 +62,13 @@ const hwaddr rockchip_rk3399_memmap[] = {
     [RK3399_DEV_UART3] = 0xff1b0000,
     [RK3399_DEV_RKTIMER] = 0xff850000,
     [RK3399_DEV_GRF] = 0xff770000,
+    [RK3399_DEV_CPU_DEBUG0] = 0xfe430000,
+    [RK3399_DEV_CPU_DEBUG1] = 0xfe432000,
+    [RK3399_DEV_CPU_DEBUG2] = 0xfe434000,
+    [RK3399_DEV_CPU_DEBUG3] = 0xfe436000,
+    [RK3399_DEV_CPU_DEBUG4] = 0xfe610000,
+    [RK3399_DEV_CPU_DEBUG5] = 0xfe710000,
+    [RK3399_DEV_PMU] = 0xff310000,
 };
 
 static void rockchip_rk3399_init(Object *obj)
@@ -209,6 +223,15 @@ static void rockchip_rk3399_machine_init(MachineState *ms)
 
     create_unimplemented_device("rktimer", rockchip_rk3399_memmap[RK3399_DEV_RKTIMER], 0x20);
     create_unimplemented_device("grf", rockchip_rk3399_memmap[RK3399_DEV_GRF], 0x10000);
+
+    create_unimplemented_device("debug", rockchip_rk3399_memmap[RK3399_DEV_CPU_DEBUG0], 0x1000);
+    create_unimplemented_device("debug", rockchip_rk3399_memmap[RK3399_DEV_CPU_DEBUG1], 0x1000);
+    create_unimplemented_device("debug", rockchip_rk3399_memmap[RK3399_DEV_CPU_DEBUG2], 0x1000);
+    create_unimplemented_device("debug", rockchip_rk3399_memmap[RK3399_DEV_CPU_DEBUG3], 0x1000);
+    create_unimplemented_device("debug", rockchip_rk3399_memmap[RK3399_DEV_CPU_DEBUG4], 0x1000);
+    create_unimplemented_device("debug", rockchip_rk3399_memmap[RK3399_DEV_CPU_DEBUG5], 0x1000);
+
+    create_unimplemented_device("pmu", rockchip_rk3399_memmap[RK3399_DEV_PMU], 0x1000);
 
     // Boot
     s->bootinfo.ram_size = ms->ram_size;
