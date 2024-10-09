@@ -13,13 +13,16 @@
 #include "hw/usb/hcd-ehci.h"
 #include "hw/loader.h"
 #include "hw/intc/arm_gicv3_common.h"
+#include "hw/intc/arm_gicv3_its_common.h"
+#include "hw/arm/bsa.h"
 #include "sysemu/sysemu.h"
 #include "hw/arm/rockchip-rk3399.h"
 #include "target/arm/cpu-qom.h"
 #include "target/arm/cpu.h"
 #include "target/arm/gtimer.h"
 #include "qapi/qmp/qlist.h"
-#include <stdint.h>
+
+#define NUM_IRQS 256
 
 enum {
     RK3399_SYSMEM,
@@ -33,6 +36,8 @@ enum {
     RK3399_DEV_UART1,
     RK3399_DEV_UART2,
     RK3399_DEV_UART3,
+    RK3399_DEV_RKTIMER,
+    RK3399_DEV_GRF,
 };
 
 /* Memory map */
@@ -48,12 +53,108 @@ const hwaddr rockchip_rk3399_memmap[] = {
     [RK3399_DEV_UART1] = 0xff190000,
     [RK3399_DEV_UART2] = 0xff1a0000,
     [RK3399_DEV_UART3] = 0xff1b0000,
+    [RK3399_DEV_RKTIMER] = 0xff850000,
+    [RK3399_DEV_GRF] = 0xff770000,
 };
 
 static void rockchip_rk3399_init(Object *obj)
 {
     // RK3399State *s = ROCKCHIP_RK3399(obj);
     printf("rockchip_rk3399_init\n");
+}
+
+static void create_its(RK3399State *sms)
+{
+    const char *itsclass = its_class_name();
+    DeviceState *dev;
+
+    dev = qdev_new(itsclass);
+
+    object_property_set_link(OBJECT(dev), "parent-gicv3", OBJECT(sms->gic),
+                             &error_abort);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, rockchip_rk3399_memmap[RK3399_DEV_GIC_ITS]);
+}
+
+static void create_gic(RK3399State *sms, MemoryRegion *mem)
+{
+    unsigned int smp_cpus = MACHINE(sms)->smp.cpus;
+    SysBusDevice *gicbusdev;
+    const char *gictype;
+    uint32_t redist0_capacity, redist0_count;
+    QList *redist_region_count;
+    int i;
+
+    gictype = gicv3_class_name();
+
+    sms->gic = qdev_new(gictype);
+    qdev_prop_set_uint32(sms->gic, "revision", 3);
+    qdev_prop_set_uint32(sms->gic, "num-cpu", smp_cpus);
+    /*
+     * Note that the num-irq property counts both internal and external
+     * interrupts; there are always 32 of the former (mandated by GIC spec).
+     */
+    qdev_prop_set_uint32(sms->gic, "num-irq", NUM_IRQS + 32);
+    qdev_prop_set_bit(sms->gic, "has-security-extensions", true);
+
+    redist0_capacity = 6;
+    redist0_count = MIN(smp_cpus, redist0_capacity);
+
+    redist_region_count = qlist_new();
+    qlist_append_int(redist_region_count, redist0_count);
+    qdev_prop_set_array(sms->gic, "redist-region-count", redist_region_count);
+
+    object_property_set_link(OBJECT(sms->gic), "sysmem", OBJECT(mem), &error_fatal);
+    qdev_prop_set_bit(sms->gic, "has-lpi", true);
+
+    gicbusdev = SYS_BUS_DEVICE(sms->gic);
+    sysbus_realize_and_unref(gicbusdev, &error_fatal);
+    sysbus_mmio_map(gicbusdev, 0, rockchip_rk3399_memmap[RK3399_DEV_GICD]);
+    sysbus_mmio_map(gicbusdev, 1, rockchip_rk3399_memmap[RK3399_DEV_GICR]);
+
+    /*
+     * Wire the outputs from each CPU's generic timer and the GICv3
+     * maintenance interrupt signal to the appropriate GIC PPI inputs,
+     * and the GIC's IRQ/FIQ/VIRQ/VFIQ interrupt outputs to the CPU's inputs.
+     */
+    for (i = 0; i < smp_cpus; i++) {
+        DeviceState *cpudev = DEVICE(qemu_get_cpu(i));
+        int intidbase = NUM_IRQS + i * GIC_INTERNAL;
+        int irq;
+        /*
+         * Mapping from the output timer irq lines from the CPU to the
+         * GIC PPI inputs used for this board.
+         */
+        const int timer_irq[] = {
+            [GTIMER_PHYS] = ARCH_TIMER_NS_EL1_IRQ,
+            [GTIMER_VIRT] = ARCH_TIMER_VIRT_IRQ,
+            [GTIMER_HYP]  = ARCH_TIMER_NS_EL2_IRQ,
+            [GTIMER_SEC]  = ARCH_TIMER_S_EL1_IRQ,
+            [GTIMER_HYPVIRT] = ARCH_TIMER_NS_EL2_VIRT_IRQ,
+        };
+
+        for (irq = 0; irq < ARRAY_SIZE(timer_irq); irq++) {
+            qdev_connect_gpio_out(cpudev, irq,
+                                  qdev_get_gpio_in(sms->gic,
+                                                   intidbase + timer_irq[irq]));
+        }
+
+        qdev_connect_gpio_out_named(cpudev, "gicv3-maintenance-interrupt", 0,
+                                    qdev_get_gpio_in(sms->gic,
+                                                     intidbase
+                                                     + ARCH_GIC_MAINT_IRQ));
+
+        qdev_connect_gpio_out_named(cpudev, "pmu-interrupt", 0,
+                                    qdev_get_gpio_in(sms->gic,
+                                                     intidbase
+                                                     + VIRTUAL_PMU_IRQ));
+
+        sysbus_connect_irq(gicbusdev, i, qdev_get_gpio_in(cpudev, ARM_CPU_IRQ));
+        sysbus_connect_irq(gicbusdev, i + smp_cpus, qdev_get_gpio_in(cpudev, ARM_CPU_FIQ));
+        sysbus_connect_irq(gicbusdev, i + 2 * smp_cpus, qdev_get_gpio_in(cpudev, ARM_CPU_VIRQ));
+        sysbus_connect_irq(gicbusdev, i + 3 * smp_cpus, qdev_get_gpio_in(cpudev, ARM_CPU_VFIQ));
+    }
+    create_its(sms);
 }
 
 static void rockchip_rk3399_machine_init(MachineState *ms)
@@ -82,30 +183,7 @@ static void rockchip_rk3399_machine_init(MachineState *ms)
     }
 
     // Create GIC
-    s->gic = qdev_new(gicv3_class_name());
-    qdev_prop_set_uint32(s->gic, "revision", 3);
-    qdev_prop_set_uint32(s->gic, "num-cpu", smp_cpus);
-    /* Note that the num-irq property counts both internal and external
-     * interrupts; there are always 32 of the former (mandated by GIC spec).
-     */
-#define NUM_IRQS 256
-    qdev_prop_set_uint32(s->gic, "num-irq", NUM_IRQS + 32);
-
-    QList *redist_region_count;
-    redist_region_count = qlist_new();
-    qlist_append_int(redist_region_count, smp_cpus);
-    qdev_prop_set_array(s->gic, "redist-region-count", redist_region_count);
-
-    object_property_set_link(OBJECT(s->gic), "sysmem", OBJECT(ms->ram), &error_fatal);
-    qdev_prop_set_bit(s->gic, "has-lpi", true);
-
-    SysBusDevice *gicbusdev;
-    gicbusdev = SYS_BUS_DEVICE(s->gic);
-    sysbus_realize_and_unref(gicbusdev, &error_fatal);
-    sysbus_mmio_map(gicbusdev, 0, rockchip_rk3399_memmap[RK3399_DEV_GICD]);
-    sysbus_mmio_map(gicbusdev, 1, rockchip_rk3399_memmap[RK3399_DEV_GICR]);
-
-    create_unimplemented_device("its", rockchip_rk3399_memmap[RK3399_DEV_GIC_ITS], 0x20000);
+    create_gic(s, sysmem);
 
     // Create CRU as dummy
     s->pmucru = qdev_new(TYPE_RK3399_PMUCRU);
@@ -116,10 +194,21 @@ static void rockchip_rk3399_machine_init(MachineState *ms)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(s->cru), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(s->cru), 0, rockchip_rk3399_memmap[RK3399_DEV_CRU]);
 
-    create_unimplemented_device("uart0", rockchip_rk3399_memmap[RK3399_DEV_UART0], 0x100);
-    create_unimplemented_device("uart1", rockchip_rk3399_memmap[RK3399_DEV_UART1], 0x100);
-    create_unimplemented_device("uart2", rockchip_rk3399_memmap[RK3399_DEV_UART2], 0x100);
-    create_unimplemented_device("uart3", rockchip_rk3399_memmap[RK3399_DEV_UART3], 0x100);
+    // serial_mm_init(get_system_memory(), rockchip_rk3399_memmap[RK3399_DEV_UART0], 2,
+    //                qdev_get_gpio_in(s->gic, 99),
+    //                115200, serial_hd(2), DEVICE_NATIVE_ENDIAN);
+    // serial_mm_init(get_system_memory(), rockchip_rk3399_memmap[RK3399_DEV_UART1], 2,
+    //                qdev_get_gpio_in(s->gic, 98),
+    //                115200, serial_hd(1), DEVICE_NATIVE_ENDIAN);
+    serial_mm_init(get_system_memory(), rockchip_rk3399_memmap[RK3399_DEV_UART2], 2,
+                   qdev_get_gpio_in(s->gic, 100),
+                   115200, serial_hd(0), DEVICE_NATIVE_ENDIAN);
+    // serial_mm_init(get_system_memory(), rockchip_rk3399_memmap[RK3399_DEV_UART3], 2,
+    //                qdev_get_gpio_in(s->gic, 101),
+    //                115200, serial_hd(3), DEVICE_NATIVE_ENDIAN);
+
+    create_unimplemented_device("rktimer", rockchip_rk3399_memmap[RK3399_DEV_RKTIMER], 0x20);
+    create_unimplemented_device("grf", rockchip_rk3399_memmap[RK3399_DEV_GRF], 0x10000);
 
     // Boot
     s->bootinfo.ram_size = ms->ram_size;
