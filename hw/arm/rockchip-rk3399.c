@@ -8,7 +8,7 @@
 #include "hw/arm/boot.h"
 #include "hw/boards.h"
 #include "hw/sysbus.h"
-#include "hw/char/serial.h"
+#include "hw/char/serial-mm.h"
 #include "hw/misc/unimp.h"
 #include "hw/usb/hcd-ehci.h"
 #include "hw/loader.h"
